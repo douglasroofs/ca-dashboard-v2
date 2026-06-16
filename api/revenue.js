@@ -1,65 +1,97 @@
-// api/revenue.js - MTD revenue from LEAP Sales Performance Summary Report
-// Auth: uses JP_LEAP_TOKEN (OAuth session access_token from LEAP web login)
-// Header: platform: web  (required by LEAP public API)
-// CloudFront: CF signed cookies + AWSALB required (LEAP_CF_COOKIES env var)
+// api/revenue.js - MTD revenue from LEAP v3 API
+// Auth: JP_API_TOKEN (JWT) - server-to-server, no session cookies needed
+// Groups awarded MTD jobs by customer rep (falls back to created_by user)
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const token = process.env.JP_LEAP_TOKEN || process.env.JP_PUBLIC_TOKEN || process.env.JP_API_TOKEN;
-  if (!token) return res.status(500).json({ error: 'No API token configured. Set JP_LEAP_TOKEN in Vercel env vars.' });
+  const token = process.env.JP_API_TOKEN;
+  if (!token) return res.status(500).json({ error: 'JP_API_TOKEN not set in Vercel env vars.' });
 
-  const BASE = 'https://jobprogress.com/api/public/api/v1';
-  const params = new URLSearchParams({
-        duration: 'MTD', with_inactive: '0', with_archived: '0',
-        limit: '50', page: '1', sort_field: 'full_name', sort_order: 'asc',
-  });
-  params.append('date_range_type[]', 'job_awarded_date');
-  const debug = req.query.debug === '1';
-
+  const BASE = 'https://api.jobprogress.com/api/v3';
   const headers = {
     'Authorization': 'Bearer ' + token,
-    'platform': 'web',
     'Accept': 'application/json',
     'Content-Type': 'application/json',
-    'Origin': 'https://www.jobprogress.com',
-    'Referer': 'https://www.jobprogress.com/app/',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
   };
-  if (process.env.LEAP_CF_COOKIES) {
-    headers['Cookie'] = process.env.LEAP_CF_COOKIES;
-  }
+
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const awardedFrom = `${year}-${month}-01`;
+  const awardedTo = `${year}-${month}-${day}`;
+  const debug = req.query.debug === '1';
 
   try {
-    const resp = await fetch(`${BASE}/reports/sales_performance_summary_report?${params}`, { headers });
-    if (!resp.ok) {
-      const text = await resp.text();
-      if (debug) {
-        const respHeaders = {};
-        resp.headers.forEach((v, k) => { respHeaders[k] = v; });
-        return res.status(resp.status).json({
-          error: 'LEAP API error', status: resp.status,
-          body: text.substring(0, 500),
-          responseHeaders: respHeaders,
-          hint: resp.status === 401 ? 'Refresh JP_LEAP_TOKEN + LEAP_CF_COOKIES from LEAP browser session.' : undefined,
-        });
+    // 1. Fetch company users to map created_by IDs to names
+    const usersResp = await fetch(`${BASE}/users?limit=500`, { headers });
+    const usersJson = usersResp.ok ? await usersResp.json() : {};
+    const userList = usersJson?.data || [];
+    const userMap = {};
+    userList.forEach(u => {
+      userMap[u.id] = u.full_name || `${u.first_name || ''} ${u.last_name || ''}`.trim();
+    });
+
+    // 2. Fetch all awarded MTD jobs (paginated)
+    let allJobs = [];
+    let page = 1;
+    while (true) {
+      const url = `${BASE}/jobs?awarded_jobs=1&awarded_from=${awardedFrom}&awarded_to=${awardedTo}` +
+        `&includes[]=reps&includes[]=estimators&includes[]=financial_details` +
+        `&limit=100&page=${page}`;
+      const resp = await fetch(url, { headers });
+      if (!resp.ok) {
+        const text = await resp.text();
+        if (debug) {
+          const rh = {};
+          resp.headers.forEach((v, k) => { rh[k] = v; });
+          return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status, body: text.substring(0, 500), responseHeaders: rh });
+        }
+        return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status });
       }
-      return res.status(resp.status).json({ error: 'LEAP API error', status: resp.status, body: text.substring(0, 300) });
+      const json = await resp.json();
+      const jobs = json?.data || [];
+      allJobs = allJobs.concat(jobs);
+      if (jobs.length < 100) break;
+      page++;
+      if (page > 20) break;
     }
-    const json = await resp.json();
-    const rows = json.data || json || [];
-    if (debug) return res.status(200).json({ raw: json, rowCount: rows.length, sampleKeys: rows[0] ? Object.keys(rows[0]) : [] });
-    const reps = rows.map(r => ({
-      id: r.id,
-      name: r.full_name || `${r.first_name || ''} ${r.last_name || ''}`.trim(),
-      contractAmount: parseFloat(r.contract_amount || 0),
-      bidAmount: parseFloat(r.bid_amount || 0),
-      closingPct: parseFloat(r.closing_percentage || 0),
-      contractsCount: parseInt(r.contracts_jobs_count || 0, 10),
-      bidsCount: parseInt(r.bids_jobs_count || 0, 10),
-    })).filter(r => r.name);
+
+    // 3. Group by rep: reps.data[0] > estimators.data[0] > created_by
+    const repMap = {};
+    for (const job of allJobs) {
+      const amount = parseFloat(job.amount || 0);
+      let repId, repName;
+
+      if (job.reps?.data?.length > 0) {
+        const r = job.reps.data[0];
+        repId = r.id;
+        repName = r.full_name || `${r.first_name || ''} ${r.last_name || ''}`.trim();
+      } else if (job.estimators?.data?.length > 0) {
+        const e = job.estimators.data[0];
+        repId = e.id;
+        repName = e.full_name || `${e.first_name || ''} ${e.last_name || ''}`.trim();
+      } else if (job.created_by) {
+        repId = `u_${job.created_by}`;
+        repName = userMap[job.created_by] || `User ${job.created_by}`;
+      } else {
+        repId = 'unassigned';
+        repName = 'Unassigned';
+      }
+
+      if (!repMap[repId]) repMap[repId] = { id: repId, name: repName, contractAmount: 0, contractsCount: 0 };
+      repMap[repId].contractAmount += amount;
+      repMap[repId].contractsCount += 1;
+    }
+
+    const reps = Object.values(repMap)
+      .filter(r => r.name && r.contractAmount > 0)
+      .sort((a, b) => a.name.localeCompare(b.name));
     const totalRevenue = reps.reduce((sum, r) => sum + r.contractAmount, 0);
+
+    if (debug) return res.status(200).json({ reps, totalRevenue, totalJobs: allJobs.length, awardedFrom, awardedTo, userMapSize: Object.keys(userMap).length });
     return res.status(200).json({ reps, totalRevenue });
   } catch (err) {
     return res.status(500).json({ error: err.message });
