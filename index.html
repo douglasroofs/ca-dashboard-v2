@@ -187,14 +187,70 @@ function fetchSrData(){return fetch('/api/sr-data?cb='+Date.now()).then(function
 function fetchRevenue(){return fetch('/api/revenue?cb='+Date.now()).then(function(r){return r.json();}).then(function(d){revReps=d.reps||[];}).catch(function(){revReps=[];});}
 function render(){renderKPIs();renderChart();renderRepList();renderDoors();renderTable();}
 function renderKPIs(){
-  var total=leapRows.length,approved=revReps.reduce(function(s,r){return s+(r.contractsCount||0);},0);
+  var total=leapRows.length,approvedTotal=revReps.reduce(function(s,r){return s+(r.contractAmount||0);},0);
   var now=new Date(),monthStr=now.getFullYear()+'-'+pad(now.getMonth()+1);
   var mtdDoors=srEvents.filter(function(e){return e.isDoor&&(e.date||'').startsWith(monthStr);});
   var mtdCAs=srEvents.filter(function(e){return e.isCA&&(e.date||'').startsWith(monthStr);});
   var doorConv=mtdDoors.length?Math.round(mtdCAs.length/mtdDoors.length*100):0;
   var totalContract=revReps.reduce(function(s,r){return s+(r.contractAmount||0);},0);
   document.getElementById('k-total').textContent=total;
-  document.getElementById('k-accepted').textContent=approved||'-';
+  document.getElementById('k-accepted').textContent=approvedTotal?'
+  document.getElementById('k-rate').textContent='won revenue MTD';
+  document.getElementById('k-contract').textContent=totalContract?'$'+fmt(totalContract):'-';
+  document.getElementById('k-doors').textContent=mtdDoors.length||'-';
+  document.getElementById('k-conv').textContent=doorConv+'% CA conversion';
+}
+function renderChart(){
+  var acc=0,sent=0,draft=0;
+  leapRows.forEach(function(r){if(r.status==='accepted')acc++;else if(r.status==='sent')sent++;else draft++;});
+  var ctx=document.getElementById('pipeline-chart').getContext('2d');
+  if(pipeChart)pipeChart.destroy();
+  pipeChart=new Chart(ctx,{type:'doughnut',data:{labels:['Accepted','Sent','Draft'],datasets:[{data:[acc,sent,draft],backgroundColor:['#059669','#d97706','#9ca3af'],borderWidth:0,hoverOffset:6}]},options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{position:'bottom',labels:{padding:16,font:{size:12}}}}}});
+}
+function renderRepList(){
+  var repMap={};
+  leapRows.forEach(function(r){if(!r.rep)return;if(!repMap[r.rep])repMap[r.rep]={name:r.rep,accepted:0,sent:0,draft:0,deals:[]};repMap[r.rep].deals.push(r);if(r.status==='accepted')repMap[r.rep].accepted++;else if(r.status==='sent')repMap[r.rep].sent++;else repMap[r.rep].draft++;});
+  revReps.forEach(function(rv){var k=rv.name||rv.rep||'';if(!k)return;if(!repMap[k])repMap[k]={name:k,accepted:0,sent:0,draft:0,deals:[]};repMap[k].revenue=rv.contractAmount||rv.amount||0;repMap[k].revJobs=rv.contractsCount||rv.jobs||0;});
+  var reps=Object.values(repMap).sort(function(a,b){return(b.accepted-a.accepted)||(b.draft+b.sent-a.draft-a.sent);});
+  var maxAcc=Math.max(1,Math.max.apply(null,reps.map(function(r){return r.accepted;})));
+  var html='';
+  reps.forEach(function(rep,i){
+    var pct=Math.round(rep.accepted/maxAcc*100),barColor=rep.accepted>0?(pct>=60?'#059669':'#1a3a6b'):'#e5e7eb';
+    var revStr=rep.revenue?' · $'+fmt(rep.revenue):'';
+    var dealHtml=rep.deals.map(function(d){var chipCls=d.status==='accepted'?'ch-acc':d.status==='sent'?'ch-sent':'ch-draft';return '<div class="deal-row"><span class="deal-customer">'+esc(d.customer||'-')+'</span><span class="deal-addr">'+esc(d.address||'-')+'</span><span class="deal-id">'+esc(d.jobId)+'</span><span class="chip '+chipCls+'">'+d.status+'</span></div>';}).join('');
+    html+='<div class="rep-row"><div class="rep-hdr" onclick="toggleDeals(this)"><div class="rep-top"><span class="rep-name"><span class="rep-rank">'+(i+1)+'</span>'+esc(rep.name)+'</span><span style="font-size:.8rem;font-weight:600;">'+rep.accepted+' accepted'+revStr+'</span></div><div class="rep-bar-wrap"><div class="rep-bar-track"><div class="rep-bar-fill" style="width:'+pct+'%;background:'+barColor+'"></div></div></div><div class="rep-stats" style="margin-top:4px"><span class="stat-val">'+rep.accepted+'</span>&nbsp;acc&nbsp;·&nbsp;<span class="stat-val">'+rep.sent+'</span>&nbsp;sent&nbsp;·&nbsp;<span class="stat-val">'+rep.draft+'</span>&nbsp;draft</div></div><div class="rep-deals">'+dealHtml+'</div></div>';
+  });
+  document.getElementById('rep-list').innerHTML=html||'<div class="empty">No rep data yet</div>';
+}
+function renderDoors(){
+  var now=new Date(),monthStr=now.getFullYear()+'-'+pad(now.getMonth()+1);
+  var mtdEvents=srEvents.filter(function(e){return(e.date||'').startsWith(monthStr);});
+  var repMap={};
+  mtdEvents.forEach(function(e){if(!repMap[e.repName])repMap[e.repName]={doors:0,cas:0};if(e.isDoor)repMap[e.repName].doors++;if(e.isCA)repMap[e.repName].cas++;});
+  var reps=Object.keys(repMap).sort(function(a,b){return repMap[b].doors-repMap[a].doors;});
+  if(!reps.length){document.getElementById('door-grid').innerHTML='<div class="empty" style="grid-column:1/-1">No door activity recorded yet</div>';return;}
+  var html=reps.map(function(name){var d=repMap[name],conv=d.doors?Math.round(d.cas/d.doors*100):0;return '<div class="door-card"><div class="door-name">'+esc(name)+'</div><div class="door-nums"><div class="door-stat"><strong>'+d.doors+'</strong>Doors</div><div class="door-stat green"><strong>'+d.cas+'</strong>CAs</div><div class="door-stat amber"><strong>'+conv+'%</strong>Conv</div></div></div>';}).join('');
+  document.getElementById('door-grid').innerHTML=html;
+}
+function renderTable(){
+  var q=document.getElementById('search').value.toLowerCase();
+  var filtered=leapRows.filter(function(r){if(tableFilter!=='all'&&r.status!==tableFilter)return false;if(q&&(r.customer+' '+r.rep+' '+r.address+' '+r.jobId).toLowerCase().indexOf(q)<0)return false;return true;});
+  filtered.sort(function(a,b){var va=a[sortCol]||'',vb=b[sortCol]||'';return sortDir==='asc'?va.localeCompare(vb):vb.localeCompare(va);});
+  document.getElementById('table-count').textContent='('+filtered.length+')';
+  if(!filtered.length){document.getElementById('tbody').innerHTML='<tr><td colspan="5" class="empty">No CAs match your filters</td></tr>';return;}
+  document.getElementById('tbody').innerHTML=filtered.map(function(r){var chipCls=r.status==='accepted'?'ch-acc':r.status==='sent'?'ch-sent':'ch-draft';return '<tr><td><span class="jid">'+esc(r.jobId)+'</span></td><td><span class="cname">'+esc(r.customer)+'</span></td><td class="hm">'+esc(r.address)+'</td><td>'+esc(r.rep)+'</td><td><span class="chip '+chipCls+'">'+r.status+'</span></td></tr>';}).join('');
+}
+function toggleDeals(hdr){hdr.parentElement.querySelector('.rep-deals').classList.toggle('open');}
+function setFilter(f,el){tableFilter=f;document.querySelectorAll('.pill').forEach(function(p){p.classList.remove('active');});el.classList.add('active');renderTable();}
+function sortBy(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';else{sortCol=col;sortDir='asc';}renderTable();}
+function pad(n){return String(n).padStart(2,'0');}
+function fmt(n){return Math.round(n).toLocaleString();}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function showErr(msg){var b=document.getElementById('err-box');b.textContent=msg;b.style.display='block';}
+</script>
+</body>
+</html>
++fmt(approvedTotal):'-';
   document.getElementById('k-rate').textContent='jobs approved MTD';
   document.getElementById('k-contract').textContent=totalContract?'$'+fmt(totalContract):'-';
   document.getElementById('k-doors').textContent=mtdDoors.length||'-';
