@@ -26,12 +26,13 @@ module.exports = async function handler(req, res) {
 
   try {
     // 1. Fetch all company users to map created_by IDs -> names
-    const usersResp = await fetch(`${BASE}/users?limit=500`, { headers });
+    const usersResp = await fetch(`${BASE}/users?limit=200`, { headers });
     const usersJson = usersResp.ok ? await usersResp.json() : {};
     const userList = usersJson?.data || [];
     const userMap = {};
     userList.forEach(u => {
-      userMap[u.id] = u.full_name || `${u.first_name || ''} ${u.last_name || ''}`.trim();
+      userMap[u.id] = u.display_name || u.name ||
+        `${u.first_name || ''} ${u.last_name || ''}`.trim();
     });
 
     // 2. Fetch all awarded MTD jobs with reps + financial details (paginated)
@@ -54,16 +55,17 @@ module.exports = async function handler(req, res) {
       const json = await resp.json();
       const jobs = json?.data || [];
       allJobs = allJobs.concat(jobs);
-      // Stop if we got fewer than 100 (last page)
       if (jobs.length < 100) break;
       page++;
-      if (page > 20) break; // Safety limit
+      if (page > 20) break;
     }
 
     // 3. Group by rep: reps.data[0] > estimators.data[0] > created_by
+    // Amount = financial_details.final_job_total (Document Amount in LEAP UI)
     const repMap = {};
     for (const job of allJobs) {
-      const amount = parseFloat(job.amount || 0);
+      const fd = job.financial_details || {};
+      const amount = parseFloat(fd.final_job_total || fd.total_job_price || 0);
 
       let repId = null;
       let repName = null;
@@ -71,11 +73,11 @@ module.exports = async function handler(req, res) {
       if (job.reps?.data?.length > 0) {
         const r = job.reps.data[0];
         repId = r.id;
-        repName = r.full_name || `${r.first_name || ''} ${r.last_name || ''}`.trim();
+        repName = r.display_name || r.full_name || `${r.first_name || ''} ${r.last_name || ''}`.trim();
       } else if (job.estimators?.data?.length > 0) {
         const e = job.estimators.data[0];
         repId = e.id;
-        repName = e.full_name || `${e.first_name || ''} ${e.last_name || ''}`.trim();
+        repName = e.display_name || e.full_name || `${e.first_name || ''} ${e.last_name || ''}`.trim();
       } else if (job.created_by) {
         repId = `u_${job.created_by}`;
         repName = userMap[job.created_by] || `User ${job.created_by}`;
@@ -98,15 +100,14 @@ module.exports = async function handler(req, res) {
 
     if (debug) {
       const sampleJob = allJobs[0] || null;
-      const repMapRaw = Object.values(repMap); // unfiltered, so we can see 0-amount reps
       return res.status(200).json({
         reps, totalRevenue,
         totalJobs: allJobs.length,
         awardedFrom, awardedTo,
         userMapSize: Object.keys(userMap).length,
-        usersRawSample: usersJson, // full users response to check structure
-        sampleJob,                 // first job to check field names
-        repMapRaw,                 // all reps before filter
+        usersStatus: usersResp.status,
+        sampleJobFD: sampleJob?.financial_details,
+        repMapAll: Object.values(repMap),
       });
     }
     return res.status(200).json({ reps, totalRevenue });
