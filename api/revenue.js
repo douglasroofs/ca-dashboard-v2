@@ -25,7 +25,7 @@ module.exports = async function handler(req, res) {
   const debug = req.query.debug === '1';
 
   try {
-    // 1. Fetch company users to map created_by IDs to names
+    // 1. Fetch all company users to map created_by IDs -> names
     const usersResp = await fetch(`${BASE}/users?limit=500`, { headers });
     const usersJson = usersResp.ok ? await usersResp.json() : {};
     const userList = usersJson?.data || [];
@@ -34,7 +34,7 @@ module.exports = async function handler(req, res) {
       userMap[u.id] = u.full_name || `${u.first_name || ''} ${u.last_name || ''}`.trim();
     });
 
-    // 2. Fetch all awarded MTD jobs (paginated)
+    // 2. Fetch all awarded MTD jobs with reps + financial details (paginated)
     let allJobs = [];
     let page = 1;
     while (true) {
@@ -45,25 +45,28 @@ module.exports = async function handler(req, res) {
       if (!resp.ok) {
         const text = await resp.text();
         if (debug) {
-          const rh = {};
-          resp.headers.forEach((v, k) => { rh[k] = v; });
-          return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status, body: text.substring(0, 500), responseHeaders: rh });
+          const respHeaders = {};
+          resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+          return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status, body: text.substring(0, 500), responseHeaders: respHeaders });
         }
         return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status });
       }
       const json = await resp.json();
       const jobs = json?.data || [];
       allJobs = allJobs.concat(jobs);
+      // Stop if we got fewer than 100 (last page)
       if (jobs.length < 100) break;
       page++;
-      if (page > 20) break;
+      if (page > 20) break; // Safety limit
     }
 
     // 3. Group by rep: reps.data[0] > estimators.data[0] > created_by
     const repMap = {};
     for (const job of allJobs) {
       const amount = parseFloat(job.amount || 0);
-      let repId, repName;
+
+      let repId = null;
+      let repName = null;
 
       if (job.reps?.data?.length > 0) {
         const r = job.reps.data[0];
@@ -81,7 +84,9 @@ module.exports = async function handler(req, res) {
         repName = 'Unassigned';
       }
 
-      if (!repMap[repId]) repMap[repId] = { id: repId, name: repName, contractAmount: 0, contractsCount: 0 };
+      if (!repMap[repId]) {
+        repMap[repId] = { id: repId, name: repName, contractAmount: 0, contractsCount: 0 };
+      }
       repMap[repId].contractAmount += amount;
       repMap[repId].contractsCount += 1;
     }
@@ -91,8 +96,21 @@ module.exports = async function handler(req, res) {
       .sort((a, b) => a.name.localeCompare(b.name));
     const totalRevenue = reps.reduce((sum, r) => sum + r.contractAmount, 0);
 
-    if (debug) return res.status(200).json({ reps, totalRevenue, totalJobs: allJobs.length, awardedFrom, awardedTo, userMapSize: Object.keys(userMap).length });
+    if (debug) {
+      const sampleJob = allJobs[0] || null;
+      const repMapRaw = Object.values(repMap); // unfiltered, so we can see 0-amount reps
+      return res.status(200).json({
+        reps, totalRevenue,
+        totalJobs: allJobs.length,
+        awardedFrom, awardedTo,
+        userMapSize: Object.keys(userMap).length,
+        usersRawSample: usersJson, // full users response to check structure
+        sampleJob,                 // first job to check field names
+        repMapRaw,                 // all reps before filter
+      });
+    }
     return res.status(200).json({ reps, totalRevenue });
+
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
