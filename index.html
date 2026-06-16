@@ -192,7 +192,7 @@ function renderKPIs(){
   var mtdDoors=srEvents.filter(function(e){return e.isDoor&&(e.date||'').startsWith(monthStr);});
   var mtdCAs=srEvents.filter(function(e){return e.isCA&&(e.date||'').startsWith(monthStr);});
   var doorConv=mtdDoors.length?Math.round(mtdCAs.length/mtdDoors.length*100):0;
-  var totalContract=revReps.reduce(function(s,r){return s+(r.amount||0);},0);
+  var totalContract=revReps.reduce(function(s,r){return s+(r.contractAmount||0);},0);
   document.getElementById('k-total').textContent=total;
   document.getElementById('k-accepted').textContent=accepted;
   document.getElementById('k-rate').textContent=rate+'% close rate';
@@ -210,7 +210,7 @@ function renderChart(){
 function renderRepList(){
   var repMap={};
   leapRows.forEach(function(r){if(!r.rep)return;if(!repMap[r.rep])repMap[r.rep]={name:r.rep,accepted:0,sent:0,draft:0,deals:[]};repMap[r.rep].deals.push(r);if(r.status==='accepted')repMap[r.rep].accepted++;else if(r.status==='sent')repMap[r.rep].sent++;else repMap[r.rep].draft++;});
-  revReps.forEach(function(rv){if(!repMap[rv.rep])repMap[rv.rep]={name:rv.rep,accepted:0,sent:0,draft:0,deals:[]};repMap[rv.rep].revenue=rv.amount||0;repMap[rv.rep].revJobs=rv.jobs||0;});
+  revReps.forEach(function(rv){var k=rv.name||rv.rep||'';if(!k)return;if(!repMap[k])repMap[k]={name:k,accepted:0,sent:0,draft:0,deals:[]};repMap[k].revenue=rv.contractAmount||rv.amount||0;repMap[k].revJobs=rv.contractsCount||rv.jobs||0;});
   var reps=Object.values(repMap).sort(function(a,b){return(b.accepted-a.accepted)||(b.draft+b.sent-a.draft-a.sent);});
   var maxAcc=Math.max(1,Math.max.apply(null,reps.map(function(r){return r.accepted;})));
   var html='';
