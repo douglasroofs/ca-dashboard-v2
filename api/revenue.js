@@ -15,6 +15,8 @@ module.exports = async function handler(req, res) {
     'Accept': 'application/json',
     'Content-Type': 'application/json',
   };
+  // Use auth-only for GET endpoints - Content-Type causes 404 on some v3 routes
+  const authOnly = { 'Authorization': 'Bearer ' + token };
 
   const now = new Date();
   const year = now.getFullYear();
@@ -24,21 +26,10 @@ module.exports = async function handler(req, res) {
   const awardedTo = `${year}-${month}-${day}`;
   const debug = req.query.debug === '1';
 
-  try {
-    // 1. Fetch all company users to map created_by IDs -> names
-    // Use auth-only headers — Content-Type on GET causes 404 on /users endpoint
-    const authHeaders = { 'Authorization': 'Bearer ' + token };
-    const usersResp = await fetch(`${BASE}/users?limit=200`, { headers: authHeaders });
-    const usersJson = usersResp.ok ? await usersResp.json() : {};
-    const userList = usersJson?.data || [];
-    const userMap = {};
-    userList.forEach(u => {
-      const n = u.display_name || u.name ||
-        `${u.first_name || ''} ${u.last_name || ''}`.trim();
-      userMap[u.id] = n.replace(/\s+/g, ' ').trim();
-    });
+  const normName = s => (s || '').replace(/\s+/g, ' ').trim();
 
-    // 2. Fetch all awarded MTD jobs with reps + financial details (paginated)
+  try {
+    // 1. Fetch awarded MTD jobs with reps + financial details (paginated)
     let allJobs = [];
     let page = 1;
     while (true) {
@@ -49,9 +40,9 @@ module.exports = async function handler(req, res) {
       if (!resp.ok) {
         const text = await resp.text();
         if (debug) {
-          const respHeaders = {};
-          resp.headers.forEach((v, k) => { respHeaders[k] = v; });
-          return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status, body: text.substring(0, 500), responseHeaders: respHeaders });
+          const rh = {};
+          resp.headers.forEach((v, k) => { rh[k] = v; });
+          return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status, body: text.substring(0, 500), responseHeaders: rh });
         }
         return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status });
       }
@@ -63,14 +54,13 @@ module.exports = async function handler(req, res) {
       if (page > 20) break;
     }
 
-    // 3. Group by rep: reps.data[0] > estimators.data[0] > created_by
+    // 2. Group by rep: reps.data[0] > estimators.data[0] > created_by
     // Amount = financial_details.final_job_total (Document Amount in LEAP UI)
     const repMap = {};
     for (const job of allJobs) {
       const fd = job.financial_details || {};
       const amount = parseFloat(fd.final_job_total || fd.total_job_price || 0);
 
-      const normName = s => (s || '').replace(/\s+/g, ' ').trim();
       let repId = null;
       let repName = null;
 
@@ -84,7 +74,7 @@ module.exports = async function handler(req, res) {
         repName = normName(e.display_name || e.full_name || `${e.first_name || ''} ${e.last_name || ''}`);
       } else if (job.created_by) {
         repId = `u_${job.created_by}`;
-        repName = userMap[job.created_by] || `User ${job.created_by}`;
+        repName = `User ${job.created_by}`; // resolved below
       } else {
         repId = 'unassigned';
         repName = 'Unassigned';
@@ -97,6 +87,26 @@ module.exports = async function handler(req, res) {
       repMap[repId].contractsCount += 1;
     }
 
+    // 3. Resolve created_by user IDs individually (list endpoint returns 404 with this JWT)
+    const unknownEntries = Object.values(repMap).filter(r => String(r.id).startsWith('u_'));
+    if (unknownEntries.length > 0) {
+      const results = await Promise.all(
+        unknownEntries.map(r => {
+          const uid = String(r.id).slice(2);
+          return fetch(`${BASE}/users/${uid}`, { headers: authOnly })
+            .then(res2 => res2.ok ? res2.json() : null)
+            .catch(() => null);
+        })
+      );
+      results.forEach((result, i) => {
+        if (result) {
+          const u = result.data || result;
+          const n = normName(u.display_name || u.name || `${u.first_name || ''} ${u.last_name || ''}`);
+          if (n) repMap[unknownEntries[i].id].name = n;
+        }
+      });
+    }
+
     const reps = Object.values(repMap)
       .filter(r => r.name && r.contractAmount > 0)
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -107,8 +117,7 @@ module.exports = async function handler(req, res) {
         reps, totalRevenue,
         totalJobs: allJobs.length,
         awardedFrom, awardedTo,
-        userMapSize: Object.keys(userMap).length,
-        usersStatus: usersResp.status,
+        unknownResolved: unknownEntries.length,
         repMapAll: Object.values(repMap),
       });
     }
