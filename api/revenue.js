@@ -1,7 +1,7 @@
 // api/revenue.js - MTD revenue from LEAP Sales Performance Summary Report
 // Auth: uses JP_LEAP_TOKEN (OAuth session access_token from LEAP web login)
 // Header: platform: web  (required by LEAP public API)
-// CloudFront: CF signed cookies required (LEAP_CF_COOKIES env var)
+// CloudFront: CF signed cookies + AWSALB required (LEAP_CF_COOKIES env var)
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-store');
@@ -23,6 +23,9 @@ module.exports = async function handler(req, res) {
     'platform': 'web',
     'Accept': 'application/json',
     'Content-Type': 'application/json',
+    'Origin': 'https://www.jobprogress.com',
+    'Referer': 'https://www.jobprogress.com/app/',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
   };
   if (process.env.LEAP_CF_COOKIES) {
     headers['Cookie'] = process.env.LEAP_CF_COOKIES;
@@ -32,13 +35,17 @@ module.exports = async function handler(req, res) {
     const resp = await fetch(`${BASE}/reports/sales_performance_summary_report?${params}`, { headers });
     if (!resp.ok) {
       const text = await resp.text();
-      return res.status(resp.status).json({
-        error: 'LEAP API error', status: resp.status,
-        body: debug ? text : text.substring(0, 300),
-        hint: resp.status === 401
-          ? 'Token expired or invalid. Update JP_LEAP_TOKEN in Vercel env vars with a fresh OAuth access_token from LEAP browser session (ls.AppUser.token.access_token). Also refresh LEAP_CF_COOKIES (CloudFront cookies expire ~5 days).'
-          : undefined,
-      });
+      if (debug) {
+        const respHeaders = {};
+        resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+        return res.status(resp.status).json({
+          error: 'LEAP API error', status: resp.status,
+          body: text.substring(0, 500),
+          responseHeaders: respHeaders,
+          hint: resp.status === 401 ? 'Refresh JP_LEAP_TOKEN + LEAP_CF_COOKIES from LEAP browser session.' : undefined,
+        });
+      }
+      return res.status(resp.status).json({ error: 'LEAP API error', status: resp.status, body: text.substring(0, 300) });
     }
     const json = await resp.json();
     const rows = json.data || json || [];
