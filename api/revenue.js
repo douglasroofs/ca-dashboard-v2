@@ -1,5 +1,5 @@
 // api/revenue.js — MTD revenue from LEAP/JobProgress
-// Uses proposals -> individual jobs approach (bulk jobs endpoint is restricted)
+// Fetches proposals -> jobs -> worksheets to get contract amounts
 // Add ?debug=1 to see raw field names from the API
 
 module.exports = async function handler(req, res) {
@@ -20,6 +20,7 @@ module.exports = async function handler(req, res) {
     const mo = String(now.getMonth() + 1).padStart(2, '0');
     const monthStr = `${year}-${mo}`;
 
+    // Fetch proposals
     const prResp = await fetch(BASE + '/proposals?limit=200', { headers });
     if (!prResp.ok) {
       return res.status(prResp.status).json({ error: 'LEAP proposals returned ' + prResp.status });
@@ -27,21 +28,31 @@ module.exports = async function handler(req, res) {
     const prData = await prResp.json();
     const allProposals = prData.data || [];
 
+    // Debug mode: show raw field names from proposal, job, and worksheet
     if (debug) {
       const sample = allProposals[0] || null;
       let sampleJob = null;
+      let sampleWorksheet = null;
+
       if (sample && sample.job_id) {
-        const jr = await fetch(`${BASE}/jobs/${sample.job_id}?includes[]=rep_user`, { headers });
+        const jr = await fetch(`${BASE}/jobs/${sample.job_id}?includes[]=rep&includes[]=rep_user`, { headers });
         if (jr.ok) { const jd = await jr.json(); sampleJob = jd.data || jd; }
       }
+      if (sample && sample.worksheet_id) {
+        const wr = await fetch(`${BASE}/worksheets/${sample.worksheet_id}`, { headers });
+        if (wr.ok) { const wd = await wr.json(); sampleWorksheet = wd.data || wd; }
+      }
+
       return res.json({
         debug: true,
         totalProposals: allProposals.length,
-        proposal: sample ? { allFields: Object.keys(sample), status: sample.status, title: sample.title, price: sample.price, total: sample.total, amount: sample.amount, grand_total: sample.grand_total, contract_amount: sample.contract_amount, created_at: sample.created_at, updated_at: sample.updated_at, signed_at: sample.signed_at, contract_signed_date: sample.contract_signed_date, date: sample.date, job_id: sample.job_id } : null,
-        job: sampleJob ? { allFields: Object.keys(sampleJob), status: sampleJob.status, contract_amount: sampleJob.contract_amount, total_amount: sampleJob.total_amount, job_total_amount: sampleJob.job_total_amount, amount: sampleJob.amount, price: sampleJob.price, contract_signed_date: sampleJob.contract_signed_date, job_awarded_date: sampleJob.job_awarded_date, created_at: sampleJob.created_at, rep_user: sampleJob.rep_user } : null
+        proposal: sample ? { allFields: Object.keys(sample), status: sample.status, title: sample.title, worksheet_id: sample.worksheet_id, job_id: sample.job_id, created_at: sample.created_at, updated_at: sample.updated_at } : null,
+        job: sampleJob ? { allFields: Object.keys(sampleJob), contract_signed_date: sampleJob.contract_signed_date, awarded_date: sampleJob.awarded_date, created_at: sampleJob.created_at, rep: sampleJob.rep, rep_user: sampleJob.rep_user } : null,
+        worksheet: sampleWorksheet ? { allFields: Object.keys(sampleWorksheet), ...sampleWorksheet } : null
       });
     }
 
+    // --- Revenue calculation ---
     const SIGNED_STATUSES = ['accepted', 'signed', 'approved', 'won', 'contracted'];
 
     const thisMonthProposals = allProposals.filter(p => {
@@ -51,28 +62,55 @@ module.exports = async function handler(req, res) {
       return dateField.startsWith(monthStr);
     });
 
+    // Get unique job IDs and worksheet IDs
     const jobIds = [...new Set(thisMonthProposals.map(p => p.job_id).filter(Boolean))];
+    const worksheetIds = [...new Set(thisMonthProposals.map(p => p.worksheet_id).filter(Boolean))];
 
+    // Fetch jobs for rep info
     const jobResults = await Promise.all(
       jobIds.map(id =>
-        fetch(`${BASE}/jobs/${id}?includes[]=rep_user`, { headers })
-          .then(r => r.ok ? r.json() : null).catch(() => null)
+        fetch(`${BASE}/jobs/${id}?includes[]=rep&includes[]=rep_user`, { headers })
+          .then(r => r.ok ? r.json() : null)
+          .catch(() => null)
       )
     );
-
     const jobMap = {};
     jobResults.forEach((result, i) => {
       if (result) jobMap[jobIds[i]] = result.data || result;
     });
 
+    // Fetch worksheets for amounts
+    const worksheetResults = await Promise.all(
+      worksheetIds.map(id =>
+        fetch(`${BASE}/worksheets/${id}`, { headers })
+          .then(r => r.ok ? r.json() : null)
+          .catch(() => null)
+      )
+    );
+    const worksheetMap = {};
+    worksheetResults.forEach((result, i) => {
+      if (result) worksheetMap[worksheetIds[i]] = result.data || result;
+    });
+
+    // Aggregate per rep
     const repMap = {};
     thisMonthProposals.forEach(p => {
       const job = jobMap[p.job_id] || {};
-      const repUser = job.rep_user || {};
+      const worksheet = worksheetMap[p.worksheet_id] || {};
+
+      // Try multiple rep field names
+      const repUser = job.rep || job.rep_user || job.sales_rep || {};
       const rep = repUser.display_name || repUser.name ||
-        ((repUser.first_name || '') + ' ' + (repUser.last_name || '')).trim();
-      if (!rep) return;
-      const amount = Number(job.contract_amount || job.total_amount || job.job_total_amount || job.amount || p.grand_total || p.price || p.total || p.amount || 0);
+        ((repUser.first_name || '') + ' ' + (repUser.last_name || '')).trim() ||
+        'Unknown';
+
+      // Try multiple amount field names from worksheet first, then job
+      const amount = Number(
+        worksheet.total || worksheet.grand_total || worksheet.subtotal ||
+        worksheet.amount || worksheet.price || worksheet.total_amount ||
+        job.contract_amount || job.total_amount || job.amount || 0
+      );
+
       if (!repMap[rep]) repMap[rep] = { rep, jobs: 0, amount: 0 };
       repMap[rep].jobs++;
       repMap[rep].amount += amount;
@@ -84,7 +122,9 @@ module.exports = async function handler(req, res) {
       month: monthStr,
       contractedCount: thisMonthProposals.length,
       reps,
-      note: thisMonthProposals.length === 0 ? 'No contracted proposals found. Add ?debug=1 to inspect field names.' : null
+      note: thisMonthProposals.length === 0
+        ? 'No contracted proposals found for this month. Add ?debug=1 to inspect field names.'
+        : null
     });
   } catch (e) {
     return res.status(500).json({ error: e.message });
