@@ -26,13 +26,16 @@ module.exports = async function handler(req, res) {
 
   try {
     // 1. Fetch all company users to map created_by IDs -> names
-    const usersResp = await fetch(`${BASE}/users?limit=200`, { headers });
+    // Use auth-only headers — Content-Type on GET causes 404 on /users endpoint
+    const authHeaders = { 'Authorization': 'Bearer ' + token };
+    const usersResp = await fetch(`${BASE}/users?limit=200`, { headers: authHeaders });
     const usersJson = usersResp.ok ? await usersResp.json() : {};
     const userList = usersJson?.data || [];
     const userMap = {};
     userList.forEach(u => {
-      userMap[u.id] = u.display_name || u.name ||
+      const n = u.display_name || u.name ||
         `${u.first_name || ''} ${u.last_name || ''}`.trim();
+      userMap[u.id] = n.replace(/\s+/g, ' ').trim();
     });
 
     // 2. Fetch all awarded MTD jobs with reps + financial details (paginated)
@@ -67,17 +70,18 @@ module.exports = async function handler(req, res) {
       const fd = job.financial_details || {};
       const amount = parseFloat(fd.final_job_total || fd.total_job_price || 0);
 
+      const normName = s => (s || '').replace(/\s+/g, ' ').trim();
       let repId = null;
       let repName = null;
 
       if (job.reps?.data?.length > 0) {
         const r = job.reps.data[0];
         repId = r.id;
-        repName = r.display_name || r.full_name || `${r.first_name || ''} ${r.last_name || ''}`.trim();
+        repName = normName(r.display_name || r.full_name || `${r.first_name || ''} ${r.last_name || ''}`);
       } else if (job.estimators?.data?.length > 0) {
         const e = job.estimators.data[0];
         repId = e.id;
-        repName = e.display_name || e.full_name || `${e.first_name || ''} ${e.last_name || ''}`.trim();
+        repName = normName(e.display_name || e.full_name || `${e.first_name || ''} ${e.last_name || ''}`);
       } else if (job.created_by) {
         repId = `u_${job.created_by}`;
         repName = userMap[job.created_by] || `User ${job.created_by}`;
@@ -99,14 +103,12 @@ module.exports = async function handler(req, res) {
     const totalRevenue = reps.reduce((sum, r) => sum + r.contractAmount, 0);
 
     if (debug) {
-      const sampleJob = allJobs[0] || null;
       return res.status(200).json({
         reps, totalRevenue,
         totalJobs: allJobs.length,
         awardedFrom, awardedTo,
         userMapSize: Object.keys(userMap).length,
         usersStatus: usersResp.status,
-        sampleJobFD: sampleJob?.financial_details,
         repMapAll: Object.values(repMap),
       });
     }
