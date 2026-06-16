@@ -119,7 +119,7 @@ tr:hover td{background:#f9fafb}
     </div>
     <div class="kgrid">
       <div class="kcard k-blue"><div class="klbl">Total CAs</div><div class="kval" id="k-total">-</div><div class="ksub">This month</div></div>
-      <div class="kcard k-green"><div class="klbl">Accepted</div><div class="kval" id="k-accepted">-</div><div class="ksub" id="k-rate">-% close rate</div></div>
+      <div class="kcard k-green"><div class="klbl">Approved</div><div class="kval" id="k-accepted">-</div><div class="ksub" id="k-rate">-% close rate</div></div>
       <div class="kcard k-amber"><div class="klbl">Contract Signed $</div><div class="kval" id="k-contract">-</div><div class="ksub">MTD revenue</div></div>
       <div class="kcard k-gray"><div class="klbl">Doors Knocked</div><div class="kval" id="k-doors">-</div><div class="ksub" id="k-conv">-% CA conversion</div></div>
     </div>
@@ -187,15 +187,15 @@ function fetchSrData(){return fetch('/api/sr-data?cb='+Date.now()).then(function
 function fetchRevenue(){return fetch('/api/revenue?cb='+Date.now()).then(function(r){return r.json();}).then(function(d){revReps=d.reps||[];}).catch(function(){revReps=[];});}
 function render(){renderKPIs();renderChart();renderRepList();renderDoors();renderTable();}
 function renderKPIs(){
-  var total=leapRows.length,accepted=leapRows.filter(function(r){return r.status==='accepted';}).length,rate=total?Math.round(accepted/total*100):0;
+  var total=leapRows.length,approved=revReps.reduce(function(s,r){return s+(r.contractsCount||0);},0);
   var now=new Date(),monthStr=now.getFullYear()+'-'+pad(now.getMonth()+1);
   var mtdDoors=srEvents.filter(function(e){return e.isDoor&&(e.date||'').startsWith(monthStr);});
   var mtdCAs=srEvents.filter(function(e){return e.isCA&&(e.date||'').startsWith(monthStr);});
   var doorConv=mtdDoors.length?Math.round(mtdCAs.length/mtdDoors.length*100):0;
   var totalContract=revReps.reduce(function(s,r){return s+(r.contractAmount||0);},0);
   document.getElementById('k-total').textContent=total;
-  document.getElementById('k-accepted').textContent=accepted;
-  document.getElementById('k-rate').textContent=rate+'% close rate';
+  document.getElementById('k-accepted').textContent=approved||'-';
+  document.getElementById('k-rate').textContent='jobs approved MTD';
   document.getElementById('k-contract').textContent=totalContract?'$'+fmt(totalContract):'-';
   document.getElementById('k-doors').textContent=mtdDoors.length||'-';
   document.getElementById('k-conv').textContent=doorConv+'% CA conversion';
