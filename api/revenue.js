@@ -1,129 +1,96 @@
-// api/revenue.js - MTD revenue from LEAP v3 API
-// Auth: JP_API_TOKEN (JWT) - server-to-server, no session cookies needed
-// Groups awarded MTD jobs by customer rep (falls back to created_by user)
+// api/revenue.js - MTD revenue from LEAP Sales Performance Summary Report
+// Calls the v1 API endpoint that powers LEAP's own Sales Performance Summary Report.
+// Tries JP_API_TOKEN first; falls back to password-grant if JP_USERNAME/JP_PASSWORD are set.
+// Excludes: Haley Barry, Doug Rimel, Kyle Higginbotham, TCNA
+
+const EXCLUDE = ['haley barry', 'doug rimel', 'kyle higginbotham', 'carmen tcna', 'tcna'];
+
+function isExcluded(name) {
+    if (!name) return true;
+    const n = name.toLowerCase().trim();
+    return EXCLUDE.some(ex => n.includes(ex));
+}
+
+async function fetchReport(accessToken) {
+    const url =
+          'https://www.jobprogress.com/api/public/api/v1/reports/sales_performance_summary_report' +
+          '?date_range_type=job_awarded_date&duration=MTD&with_inactive=0&with_archived=0' +
+          '&page=1&limit=200&access_token=' + encodeURIComponent(accessToken);
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data && data.status === 200 && Array.isArray(data.data)) return data.data;
+    return null;
+}
+
+async function passwordGrantToken() {
+    const username = process.env.JP_USERNAME;
+    const password = process.env.JP_PASSWORD;
+    if (!username || !password) return null;
+    const r = await fetch('https://www.jobprogress.com/api/public/api/v1/oauth/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+                  grant_type: 'password',
+                  username,
+                  password,
+                  client_id: process.env.JP_CLIENT_ID || 'jobprogress',
+                  client_secret: process.env.JP_CLIENT_SECRET || '',
+          }).toString(),
+    });
+    const d = await r.json();
+    return d.access_token || null;
+}
+
 module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-store');
-  if (req.method === 'OPTIONS') return res.status(200).end();
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const token = process.env.JP_API_TOKEN;
-  if (!token) return res.status(500).json({ error: 'JP_API_TOKEN not set in Vercel env vars.' });
+    const jwtToken = process.env.JP_API_TOKEN;
+    if (!jwtToken) return res.status(500).json({ error: 'JP_API_TOKEN not set.' });
 
-  const BASE = 'https://api.jobprogress.com/api/v3';
-  const headers = {
-    'Authorization': 'Bearer ' + token,
-    'Accept': 'application/json',
-    'Content-Type': 'application/json',
-  };
-  // Use auth-only for GET endpoints - Content-Type causes 404 on some v3 routes
-  const authOnly = { 'Authorization': 'Bearer ' + token };
+    let rows = null;
+    let authUsed = 'unknown';
 
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day = String(now.getDate()).padStart(2, '0');
-  const awardedFrom = `${year}-${month}-01`;
-  const awardedTo = `${year}-${month}-${day}`;
-  const debug = req.query.debug === '1';
-
-  const normName = s => (s || '').replace(/\s+/g, ' ').trim();
-
-  try {
-    // 1. Fetch awarded MTD jobs with reps + financial details (paginated)
-    let allJobs = [];
-    let page = 1;
-    while (true) {
-      const url = `${BASE}/jobs?awarded_jobs=1&awarded_from=${awardedFrom}&awarded_to=${awardedTo}` +
-        `&includes[]=reps&includes[]=estimators&includes[]=financial_details` +
-        `&limit=100&page=${page}`;
-      const resp = await fetch(url, { headers });
-      if (!resp.ok) {
-        const text = await resp.text();
-        if (debug) {
-          const rh = {};
-          resp.headers.forEach((v, k) => { rh[k] = v; });
-          return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status, body: text.substring(0, 500), responseHeaders: rh });
-        }
-        return res.status(resp.status).json({ error: 'LEAP v3 API error', status: resp.status });
-      }
-      const json = await resp.json();
-      const jobs = json?.data || [];
-      allJobs = allJobs.concat(jobs);
-      if (jobs.length < 100) break;
-      page++;
-      if (page > 20) break;
+    // Attempt 1: JP_API_TOKEN directly as v1 access_token
+    try {
+          rows = await fetchReport(jwtToken);
+          if (rows) authUsed = 'v1-jwt';
+    } catch (e) {
+          console.error('v1 jwt attempt:', e.message);
     }
 
-    // 2. Group by rep: reps.data[0] > estimators.data[0] > created_by
-    // Amount = financial_details.final_job_total (Document Amount in LEAP UI)
-    const repMap = {};
-    for (const job of allJobs) {
-      const fd = job.financial_details || {};
-      const amount = parseFloat(fd.final_job_total || fd.total_job_price || 0);
-
-      let repId = null;
-      let repName = null;
-
-      if (job.reps?.data?.length > 0) {
-        const r = job.reps.data[0];
-        repId = r.id;
-        repName = normName(r.display_name || r.full_name || `${r.first_name || ''} ${r.last_name || ''}`);
-      } else if (job.estimators?.data?.length > 0) {
-        const e = job.estimators.data[0];
-        repId = e.id;
-        repName = normName(e.display_name || e.full_name || `${e.first_name || ''} ${e.last_name || ''}`);
-      } else if (job.created_by) {
-        repId = `u_${job.created_by}`;
-        repName = `User ${job.created_by}`; // resolved below
-      } else {
-        repId = 'unassigned';
-        repName = 'Unassigned';
-      }
-
-      if (!repMap[repId]) {
-        repMap[repId] = { id: repId, name: repName, contractAmount: 0, contractsCount: 0 };
-      }
-      repMap[repId].contractAmount += amount;
-      repMap[repId].contractsCount += 1;
+    // Attempt 2: OAuth password grant (JP_USERNAME + JP_PASSWORD)
+    if (!rows) {
+          try {
+                  const oauthToken = await passwordGrantToken();
+                  if (oauthToken) {
+                            rows = await fetchReport(oauthToken);
+                            if (rows) authUsed = 'v1-oauth';
+                  }
+          } catch (e) {
+                  console.error('v1 oauth attempt:', e.message);
+          }
     }
 
-    // 3. Resolve created_by user IDs individually (list endpoint returns 404 with this JWT)
-    const unknownEntries = Object.values(repMap).filter(r => String(r.id).startsWith('u_'));
-    if (unknownEntries.length > 0) {
-      const results = await Promise.all(
-        unknownEntries.map(r => {
-          const uid = String(r.id).slice(2);
-          return fetch(`${BASE}/users/${uid}`, { headers: authOnly })
-            .then(res2 => res2.ok ? res2.json() : null)
-            .catch(() => null);
-        })
-      );
-      results.forEach((result, i) => {
-        if (result) {
-          const u = result.data || result;
-          const n = normName(u.display_name || u.name || `${u.first_name || ''} ${u.last_name || ''}`);
-          if (n) repMap[unknownEntries[i].id].name = n;
-        }
-      });
+    if (!rows) {
+          return res.status(502).json({
+                  error: 'LEAP v1 report endpoint failed. Add JP_USERNAME + JP_PASSWORD env vars if JP_API_TOKEN does not work as v1 access_token.',
+          });
     }
 
-    const reps = Object.values(repMap)
-      .filter(r => r.name && r.contractAmount > 0)
-      .sort((a, b) => a.name.localeCompare(b.name));
-    const totalRevenue = reps.reduce((sum, r) => sum + r.contractAmount, 0);
+    const reps = rows
+      .filter(r => !isExcluded(r.full_name))
+      .map(r => ({
+              id: r.id,
+              name: (r.full_name || '').trim().replace(/\s+/g, ' '),
+              contractAmount: parseFloat(r.contract_amount) || 0,
+              contractsCount: parseInt(r.awarded_job_count, 10) || 0,
+      }))
+      .filter(r => r.contractAmount > 0)
+      .sort((a, b) => b.contractAmount - a.contractAmount);
 
-    if (debug) {
-      return res.status(200).json({
-        reps, totalRevenue,
-        totalJobs: allJobs.length,
-        awardedFrom, awardedTo,
-        unknownResolved: unknownEntries.length,
-        repMapAll: Object.values(repMap),
-      });
-    }
-    return res.status(200).json({ reps, totalRevenue });
+    const totalRevenue = reps.reduce((s, r) => s + r.contractAmount, 0);
 
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
+    return res.json({ reps, totalRevenue, source: authUsed });
 };
