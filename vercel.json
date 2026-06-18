@@ -1,1 +1,4 @@
-{"rewrites":[{"source":"/api/(.*)","destination":"/api/$1"}]}
+{
+  "rewrites": [{ "source": "/api/(.*)", "destination": "/api/$1" }],
+  "crons": [{ "path": "/api/revenue-sync", "schedule": "0 11 * * *" }]
+}
