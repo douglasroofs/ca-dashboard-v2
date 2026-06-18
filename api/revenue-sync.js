@@ -1,29 +1,36 @@
-// api/revenue-sync.js — push LEAP revenue into Amplify (SalesScreen)
-// --------------------------------------------------------------------------
-// Uses the SAME proven auth as api/revenue.js: POST /api/public/api/v1/login
-// with JP_USERNAME + JP_PASSWORD → access_token, then the
-// sales_performance_summary_report (per-rep contract_amount).
-//   date_range_type=job_awarded_date     → "Approved $"
-//   date_range_type=contract_signed_date → "Contract $"
-// Revenue is per rep (full_name → Amplify email). Office split is automatic
-// via each rep's Amplify Department. Period = MTD. Trigger: /api/revenue-sync
-// Secrets (Vercel): JP_USERNAME, JP_PASSWORD, ampliphy, (optional) LEAP_CF_COOKIES.
-// --------------------------------------------------------------------------
+// api/revenue-sync.js — push LEAP (JobProgress) revenue into Amplify (SalesScreen)
+// ---------------------------------------------------------------------------
+// Auth mirrors the PROVEN api/revenue.js path (ca-dashboard v1), which returns
+// live data: OAuth password-grant login -> switch_company(5154) -> Bearer token,
+// then the sales_performance_summary_report. Per-rep contract_amount is pushed
+// to Amplify as two custom activities:
+//   date_range_type[]=job_awarded_date     -> "Approved Revenue"          (Approved $)
+//   date_range_type[]=contract_signed_date -> "Contract Signed Revenue"   (Contract $)
+// Crediting is by rep EMAIL; Amplify routes each rep to their office board via
+// their Department. Re-runs UPDATE (stable id per rep) — never double-count.
+// Secrets (Vercel): JP_USERNAME, JP_PASSWORD, ampliphy (Amplify key).
+// Optional overrides: JP_CLIENT_ID, JP_CLIENT_SECRET, JP_COMPANY_ID.
+// Trigger: GET /api/revenue-sync     (add ?dry=1 to preview WITHOUT pushing)
+// ---------------------------------------------------------------------------
 
+const V1 = "https://jobprogress.com/api/public/api/v1";
+const CLIENT_ID = process.env.JP_CLIENT_ID || "12345";
+const CLIENT_SECRET = process.env.JP_CLIENT_SECRET || "XraqRySfIhUTuvdfz7ATuJxXYf8aX5MY";
+const COMPANY_ID = process.env.JP_COMPANY_ID || "5154";
+
+const AMPLIFY_PUSH_URL = "https://connect.salesscreen.com/api/v1/Record/Add";
+const AMPLIFY_KEY = process.env.ampliphy || process.env.SALESRABBIT_PLUS_TOKEN;
 const ACTIVITY_APPROVED = "Approved Revenue";
 const ACTIVITY_CONTRACT = "Contract Signed Revenue";
-const AMPLIFY_PUSH_URL  = "https://connect.salesscreen.com/api/v1/Record/Add";
-const AMPLIFY_KEY = process.env.ampliphy || process.env.SALESRABBIT_PLUS_TOKEN;
-const JP_BASE = "https://www.jobprogress.com/api/public/api/v1";
 
-// Rep full_name (from LEAP) → Amplify user email.
+// Canonical rep name (as it appears in JobProgress) -> Amplify user email.
 const REP_EMAIL = {
   "Kelly Alston": "kelly@douglasroofs.com",
   "Steven Arevalo": "steven@douglasroofs.com",
   "Joshua Baca": "joshua@douglasroofs.com",
   "Dalton Barr": "dalton@douglasroofs.com",
-  "haley barry": "haley@douglasroofs.com",
-  "sean beasy": "sean@douglasroofs.com",
+  "Haley Barry": "haley@douglasroofs.com",
+  "Sean Beasy": "sean@douglasroofs.com",
   "George Bechara": "gbechara@douglasroofs.com",
   "Christian Brown": "christian@douglasroofs.com",
   "Logan Burbic": "logan@douglasroofs.com",
@@ -51,55 +58,114 @@ const REP_EMAIL = {
   "Andrew Prickel": "andrewprickel@douglasroofs.com",
   "Pedro Ramirez": "pedro@douglasroofs.com",
   "Cristina Saunders": "cristina@douglasroofs.com",
-  "marcus schanewolf": "marcus@douglasroofs.com",
-  "mike schoultz": "mike@douglasroofs.com",
-  "nick seward": "nick@douglasroofs.com",
+  "Marcus Schanewolf": "marcus@douglasroofs.com",
+  "Mike Schoultz": "mike@douglasroofs.com",
+  "Nick Seward": "nick@douglasroofs.com",
   "Harvey Shoemaker": "harvey@douglasroofs.com",
   "Brandon Simmons": "brandon@douglasroofs.com",
   "JR Zaguehi": "jr@douglasroofs.com",
 };
 
-async function getToken() {
-  const headers = {
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "application/json",
-  };
-  if (process.env.LEAP_CF_COOKIES) headers["Cookie"] = process.env.LEAP_CF_COOKIES; // get past Cloudflare
-  const r = await fetch(JP_BASE + "/login", {
-    method: "POST", headers,
-    body: JSON.stringify({ username: process.env.JP_USERNAME, password: process.env.JP_PASSWORD }),
+// The report sometimes returns a name that differs from the canonical one above
+// (surname/nickname drift). Map those report-name variants straight to email.
+const ALIASES = {
+  "robert wilson": "robert@douglasroofs.com",     // report: "Robert Wilson"
+  "isabelle price": "isabelle@douglasroofs.com",  // report: "Isabelle Price" (map: Izzy)
+  "michael mccarthy": "michaelmccarthy@douglasroofs.com", // report: "Michael McCarthy" (map: Mike)
+};
+
+// Normalize for tolerant matching: lowercase, collapse whitespace, trim.
+function norm(s) { return (s || "").toLowerCase().replace(/\s+/g, " ").trim(); }
+const EMAIL_BY_NORM = {};
+for (const [k, v] of Object.entries(REP_EMAIL)) EMAIL_BY_NORM[norm(k)] = v;
+for (const [k, v] of Object.entries(ALIASES)) EMAIL_BY_NORM[norm(k)] = v;
+function resolveEmail(name) { return EMAIL_BY_NORM[norm(name)] || null; }
+
+// ---- Auth (mirrors the working ca-dashboard v1 api/revenue.js) ----
+async function login() {
+  const r = await fetch(`${V1}/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: new URLSearchParams({
+      username: process.env.JP_USERNAME,
+      password: process.env.JP_PASSWORD,
+      grant_type: "password",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      end_existing_sessions: "0",
+    }).toString(),
   });
   const text = await r.text();
+  if (!r.ok) throw new Error(`login -> ${r.status}: ${text.slice(0, 150)}`);
   let d = {}; try { d = JSON.parse(text); } catch (e) {}
-  const token = d && d.data && d.data.token && d.data.token.access_token;
-  return { token: token || null, status: r.status, body: text.slice(0, 250) };
+  const token = (d.token && d.token.access_token) || d.access_token || (d.data && d.data.token && d.data.token.access_token);
+  if (!token) throw new Error("login ok but no access_token in response");
+  return token;
 }
 
-async function fetchReport(token, dateType) {
-  const url = JP_BASE + "/reports/sales_performance_summary_report"
-    + `?date_range_type=${dateType}&duration=MTD&with_inactive=0&with_archived=0&page=1&limit=500`
-    + "&access_token=" + encodeURIComponent(token);
-  const r = await fetch(url);
+async function switchCompany(token) {
+  const r = await fetch(`${V1}/users/switch_company`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json", platform: "web" },
+    body: new URLSearchParams({ company_id: COMPANY_ID }).toString(),
+  });
+  if (!r.ok) throw new Error(`switch_company -> ${r.status}: ${(await r.text()).slice(0, 150)}`);
   const d = await r.json().catch(() => ({}));
-  return Array.isArray(d && d.data) ? d.data : [];
+  return (d && d.token && d.token.access_token) || (d && d.access_token) || token;
 }
 
-function toRecords(rows, activityTypeName, suffix) {
+let _tok = null;
+async function getToken() {
+  if (!_tok) _tok = await switchCompany(await login());
+  return _tok;
+}
+
+async function apiGet(path) {
+  let token = await getToken();
+  let r = await fetch(`${V1}${path}`, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json", platform: "web" } });
+  if (r.status === 401 || r.status === 403) {
+    _tok = null;
+    token = await getToken();
+    r = await fetch(`${V1}${path}`, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json", platform: "web" } });
+  }
+  if (!r.ok) throw new Error(`GET ${path} -> ${r.status}: ${(await r.text()).slice(0, 150)}`);
+  return r.json();
+}
+
+const REPORT = "/reports/sales_performance_summary_report";
+async function fetchRows(dateType) {
+  const rows = [];
+  for (let page = 1; page <= 50; page++) {
+    const j = await apiGet(`${REPORT}?date_range_type[]=${dateType}&duration=MTD&limit=100&page=${page}&sort_field=full_name&sort_order=asc&with_inactive=0`);
+    const data = j.data || j.rows || [];
+    rows.push(...data);
+    const pag = (j.meta && j.meta.pagination) || j.pagination || {};
+    const totalPages = pag.total_pages || (data.length < 100 ? page : page + 1);
+    if (page >= totalPages || data.length === 0) break;
+  }
+  return rows;
+}
+
+function dollars(row) {
+  const n = parseFloat(row.contract_amount);
+  return isNaN(n) ? 0 : n;
+}
+
+function toRecords(rows, activityTypeName, suffix, unmapped) {
   const recs = [];
   for (const row of rows) {
-    const name = (row.full_name || "").trim().replace(/\s+/g, " ");
-    const email = REP_EMAIL[name];
-    const amount = parseFloat(row.contract_amount) || 0;
-    if (!email) { if (name) console.warn(`No email for rep "${name}" — skipped`); continue; }
+    const name = (row.full_name || "").trim();
+    const amount = dollars(row);
     if (amount <= 0) continue;
+    const email = resolveEmail(name);
+    if (!email) { if (name && !unmapped.includes(name)) unmapped.push(name); continue; }
     recs.push({
-      id: `rep-${row.id}-${suffix}`,        // stable per rep → idempotent updates
+      id: `rep-${row.id}-${suffix}`,        // stable per rep+figure -> idempotent updates
       activityTypeName,
       user: { id: email, email },
       activity: { key: "Revenue", name: "" },
       quantity: 1,
-      value1: amount,                        // → the "Amount" field the metric sums
+      value1: amount,                        // -> the "Amount" the currency metric sums
     });
   }
   return recs;
@@ -128,28 +194,44 @@ module.exports = async function handler(req, res) {
     if (!process.env.JP_USERNAME || !process.env.JP_PASSWORD) {
       return res.status(500).json({ ok: false, error: "JP_USERNAME / JP_PASSWORD not set" });
     }
-    const auth = await getToken();
-    if (!auth.token) return res.status(502).json({ ok: false, error: "LEAP login failed", status: auth.status, body: auth.body });
-    const token = auth.token;
+    const url = new URL(req.url, "http://localhost");
+    const dry = url.searchParams.get("dry");
 
     const [approvedRows, contractRows] = await Promise.all([
-      fetchReport(token, "job_awarded_date"),
-      fetchReport(token, "contract_signed_date"),
+      fetchRows("job_awarded_date"),
+      fetchRows("contract_signed_date"),
     ]);
 
-    const records = [
-      ...toRecords(approvedRows, ACTIVITY_APPROVED, "approved"),
-      ...toRecords(contractRows, ACTIVITY_CONTRACT, "contract"),
-    ];
+    const unmapped = [];
+    const approvedRecs = toRecords(approvedRows, ACTIVITY_APPROVED, "approved", unmapped);
+    const contractRecs = toRecords(contractRows, ACTIVITY_CONTRACT, "contract", unmapped);
+    const records = [...approvedRecs, ...contractRecs];
+
+    const approvedTotal = approvedRecs.reduce((s, r) => s + r.value1, 0);
+    const contractTotal = contractRecs.reduce((s, r) => s + r.value1, 0);
+
+    if (dry) {
+      return res.status(200).json({
+        ok: true, dry: true, built: records.length,
+        approvedReps: approvedRows.length, contractReps: contractRows.length,
+        approvedTotal: Math.round(approvedTotal * 100) / 100,
+        contractTotal: Math.round(contractTotal * 100) / 100,
+        unmapped, sample: records.slice(0, 6),
+      });
+    }
+
     const pushed = await pushToAmplify(records);
     return res.status(200).json({
       ok: true, pushed, built: records.length,
       approvedReps: approvedRows.length, contractReps: contractRows.length,
+      approvedTotal: Math.round(approvedTotal * 100) / 100,
+      contractTotal: Math.round(contractTotal * 100) / 100,
+      unmapped,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 };
 
-// vercel.json cron (optional, daily 7am ET):
+// vercel.json cron (optional, daily 7am ET = 11:00 UTC):
 // { "crons": [{ "path": "/api/revenue-sync", "schedule": "0 11 * * *" }] }
