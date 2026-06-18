@@ -222,6 +222,8 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         probe: true,
         keyLen: AMPLIFY_KEY ? AMPLIFY_KEY.length : 0,
+        keyPrefix: AMPLIFY_KEY ? AMPLIFY_KEY.slice(0, 4) : "",   // first 4 chars — fingerprint only
+        keySuffix: AMPLIFY_KEY ? AMPLIFY_KEY.slice(-4) : "",     // last 4 chars — fingerprint only
         keySource: process.env.ampliphy ? "ampliphy" : (process.env.SALESRABBIT_PLUS_TOKEN ? "SALESRABBIT_PLUS_TOKEN" : "none"),
         results,
       });
