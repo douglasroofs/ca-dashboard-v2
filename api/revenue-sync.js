@@ -198,18 +198,32 @@ module.exports = async function handler(req, res) {
     const url = new URL(req.url, "http://localhost");
     const dry = url.searchParams.get("dry");
 
-    // ?probe=1 — test the Amplify key in isolation against the simplest GET,
-    // and report key length/source (NOT the value) to rule out truncation.
+    // ?probe=1 — test the Amplify key against several candidate API hosts to
+    // find which one accepts it. Reports key length/source (NOT the value).
     if (url.searchParams.get("probe")) {
-      const r = await fetch("https://connect.salesscreen.com/api/v1/ActivityType/Get", { headers: { apiKey: AMPLIFY_KEY || "" } });
-      const body = await r.text();
+      const hosts = [
+        "https://connect.salesscreen.com/api/v1/ActivityType/Get",
+        "https://connect.amplify.salesrabbit.com/api/v1/ActivityType/Get",
+        "https://api.amplify.salesrabbit.com/api/v1/ActivityType/Get",
+        "https://connect.salesrabbit.com/api/v1/ActivityType/Get",
+        "https://connect.eu.salesscreen.com/api/v1/ActivityType/Get",
+        "https://amplify.salesrabbit.com/api/v1/ActivityType/Get",
+      ];
+      const results = [];
+      for (const h of hosts) {
+        try {
+          const r = await fetch(h, { headers: { apiKey: AMPLIFY_KEY || "" } });
+          const body = await r.text();
+          results.push({ host: h, status: r.status, body: body.slice(0, 120) });
+        } catch (e) {
+          results.push({ host: h, error: String((e && e.message) || e).slice(0, 120) });
+        }
+      }
       return res.status(200).json({
         probe: true,
-        keyPresent: !!AMPLIFY_KEY,
         keyLen: AMPLIFY_KEY ? AMPLIFY_KEY.length : 0,
         keySource: process.env.ampliphy ? "ampliphy" : (process.env.SALESRABBIT_PLUS_TOKEN ? "SALESRABBIT_PLUS_TOKEN" : "none"),
-        status: r.status,
-        body: body.slice(0, 300),
+        results,
       });
     }
 
