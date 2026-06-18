@@ -198,6 +198,21 @@ module.exports = async function handler(req, res) {
     const url = new URL(req.url, "http://localhost");
     const dry = url.searchParams.get("dry");
 
+    // ?probe=1 — test the Amplify key in isolation against the simplest GET,
+    // and report key length/source (NOT the value) to rule out truncation.
+    if (url.searchParams.get("probe")) {
+      const r = await fetch("https://connect.salesscreen.com/api/v1/ActivityType/Get", { headers: { apiKey: AMPLIFY_KEY || "" } });
+      const body = await r.text();
+      return res.status(200).json({
+        probe: true,
+        keyPresent: !!AMPLIFY_KEY,
+        keyLen: AMPLIFY_KEY ? AMPLIFY_KEY.length : 0,
+        keySource: process.env.ampliphy ? "ampliphy" : (process.env.SALESRABBIT_PLUS_TOKEN ? "SALESRABBIT_PLUS_TOKEN" : "none"),
+        status: r.status,
+        body: body.slice(0, 300),
+      });
+    }
+
     const [approvedRows, contractRows] = await Promise.all([
       fetchRows("job_awarded_date"),
       fetchRows("contract_signed_date"),
