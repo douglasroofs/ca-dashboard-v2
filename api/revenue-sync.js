@@ -7,7 +7,7 @@
 //   date_range_type=contract_signed_date → "Contract $"
 // Revenue is per rep (full_name → Amplify email). Office split is automatic
 // via each rep's Amplify Department. Period = MTD. Trigger: /api/revenue-sync
-// Secrets (Vercel): JP_USERNAME, JP_PASSWORD, ampliphy (Amplify API key).
+// Secrets (Vercel): JP_USERNAME, JP_PASSWORD, ampliphy, (optional) LEAP_CF_COOKIES.
 // --------------------------------------------------------------------------
 
 const ACTIVITY_APPROVED = "Approved Revenue";
@@ -60,13 +60,20 @@ const REP_EMAIL = {
 };
 
 async function getToken() {
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json",
+  };
+  if (process.env.LEAP_CF_COOKIES) headers["Cookie"] = process.env.LEAP_CF_COOKIES; // get past Cloudflare
   const r = await fetch(JP_BASE + "/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+    method: "POST", headers,
     body: JSON.stringify({ username: process.env.JP_USERNAME, password: process.env.JP_PASSWORD }),
   });
-  const d = await r.json().catch(() => ({}));
-  return (d && d.data && d.data.token && d.data.token.access_token) || null;
+  const text = await r.text();
+  let d = {}; try { d = JSON.parse(text); } catch (e) {}
+  const token = d && d.data && d.data.token && d.data.token.access_token;
+  return { token: token || null, status: r.status, body: text.slice(0, 250) };
 }
 
 async function fetchReport(token, dateType) {
@@ -121,8 +128,9 @@ module.exports = async function handler(req, res) {
     if (!process.env.JP_USERNAME || !process.env.JP_PASSWORD) {
       return res.status(500).json({ ok: false, error: "JP_USERNAME / JP_PASSWORD not set" });
     }
-    const token = await getToken();
-    if (!token) return res.status(502).json({ ok: false, error: "LEAP login failed — check JP_USERNAME / JP_PASSWORD" });
+    const auth = await getToken();
+    if (!auth.token) return res.status(502).json({ ok: false, error: "LEAP login failed", status: auth.status, body: auth.body });
+    const token = auth.token;
 
     const [approvedRows, contractRows] = await Promise.all([
       fetchReport(token, "job_awarded_date"),
