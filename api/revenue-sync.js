@@ -174,6 +174,7 @@ function toRecords(rows, activityTypeName, suffix, unmapped) {
 async function pushToAmplify(records) {
   if (!AMPLIFY_KEY) throw new Error('Missing Amplify key (set "ampliphy" in Vercel)');
   let ok = 0;
+  const errors = [];
   for (let i = 0; i < records.length; i += 100) {
     const batch = records.slice(i, i + 100);
     const res = await fetch(AMPLIFY_PUSH_URL, {
@@ -182,10 +183,10 @@ async function pushToAmplify(records) {
       body: JSON.stringify(batch),
     });
     if (res.ok) ok += batch.length;
-    else console.error("push batch failed", res.status, await res.text());
+    else { const body = await res.text(); errors.push({ status: res.status, body: body.slice(0, 300) }); }
     await new Promise((r) => setTimeout(r, 1000));
   }
-  return ok;
+  return { ok, errors };
 }
 
 module.exports = async function handler(req, res) {
@@ -220,13 +221,13 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const pushed = await pushToAmplify(records);
+    const { ok: pushed, errors } = await pushToAmplify(records);
     return res.status(200).json({
       ok: true, pushed, built: records.length,
       approvedReps: approvedRows.length, contractReps: contractRows.length,
       approvedTotal: Math.round(approvedTotal * 100) / 100,
       contractTotal: Math.round(contractTotal * 100) / 100,
-      unmapped,
+      unmapped, errors,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
